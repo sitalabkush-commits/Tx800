@@ -22,7 +22,7 @@ const String kTtsLang = 'bn-BD';
 const double kSpeechThresholdDb = -46; // এর উপরে হলে কথা বলছে ধরা হবে
 const int kSilenceStopMs = 1300; // কথা বলার পর এতক্ষণ চুপ থাকলে রেকর্ড বন্ধ
 const int kNoSpeechTimeoutMs = 8000; // কিছু না বললে ৫ সেকেন্ডে বন্ধ
-const int kMaxRecordMs = 20000;
+const int kMaxRecordMs = 15000;
 const int kSfxIgnoreMs = 1300; // শুরুর টোন চলার সময় মাইক কিছু ধরবে না
 
 // Tx 800 Mini এর ব্যক্তিত্ব (সার্ভার এটা system prompt হিসেবে ব্যবহার করবে)
@@ -235,6 +235,7 @@ class _HudScreenState extends State<HudScreen>
   double _silentMs = 0;
   bool _stopping = false;
   double _floorDb = 0; // সবচেয়ে শান্ত মুহূর্তের আওয়াজ (ঘরের নয়েজ)
+  double _peakDb = -90; // কথার সবচেয়ে জোরালো আওয়াজ
 
   @override
   void initState() {
@@ -469,6 +470,7 @@ class _HudScreenState extends State<HudScreen>
     _elapsed = 0;
     _silentMs = 0;
     _floorDb = 0;
+    _peakDb = -90;
     _recStart = DateTime.now();
     _lastVoice = _recStart;
     _setState(VoiceState.listening);
@@ -480,7 +482,9 @@ class _HudScreenState extends State<HudScreen>
       if (db < _floorDb) _floorDb = db;
       final sinceStart = DateTime.now().difference(_recStart).inMilliseconds;
       if (sinceStart > kSfxIgnoreMs) {
-        final thr = math.max(kSpeechThresholdDb, _floorDb.clamp(-60.0, -20.0) + 8);
+        var thr = math.max(kSpeechThresholdDb, _floorDb.clamp(-60.0, -20.0) + 8);
+        _peakDb = math.max(_peakDb - 0.3, db);
+        if (_heard) thr = math.max(thr, _peakDb - 18);
         if (db > thr) {
           _heard = true;
           _lastVoice = DateTime.now();
