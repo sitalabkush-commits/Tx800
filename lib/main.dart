@@ -19,9 +19,9 @@ const String kApiUrl = 'https://tx800-backend.vercel.app/api';
 const String kUserId = 'android_user';
 const String kTtsLang = 'bn-BD';
 
-const double kSpeechThresholdDb = -38; // এর উপরে হলে কথা বলছে ধরা হবে
-const int kSilenceStopMs = 1500; // কথা বলার পর এতক্ষণ চুপ থাকলে রেকর্ড বন্ধ
-const int kNoSpeechTimeoutMs = 5000; // কিছু না বললে ৫ সেকেন্ডে বন্ধ
+const double kSpeechThresholdDb = -46; // এর উপরে হলে কথা বলছে ধরা হবে
+const int kSilenceStopMs = 1800; // কথা বলার পর এতক্ষণ চুপ থাকলে রেকর্ড বন্ধ
+const int kNoSpeechTimeoutMs = 8000; // কিছু না বললে ৫ সেকেন্ডে বন্ধ
 const int kMaxRecordMs = 30000;
 
 // Tx 800 Mini এর ব্যক্তিত্ব (সার্ভার এটা system prompt হিসেবে ব্যবহার করবে)
@@ -207,6 +207,8 @@ class _HudScreenState extends State<HudScreen>
   final AudioRecorder _rec = AudioRecorder();
   final AudioPlayer _bgm = AudioPlayer();
   final AudioPlayer _sfx = AudioPlayer();
+  final AudioPlayer _voice = AudioPlayer();
+  Completer<void>? _voiceDone;
   final FlutterTts _tts = FlutterTts();
 
   VoiceState _state = VoiceState.idle;
@@ -260,6 +262,7 @@ class _HudScreenState extends State<HudScreen>
     _rec.dispose();
     _bgm.dispose();
     _sfx.dispose();
+    _voice.dispose();
     _tts.stop();
     clock.dispose();
     super.dispose();
@@ -303,7 +306,7 @@ class _HudScreenState extends State<HudScreen>
     }
     try {
       await _tts.setLanguage(kTtsLang);
-      await _tts.setSpeechRate(0.45);
+      await _tts.setSpeechRate(0.55);
       await _tts.setPitch(1.0);
       await _tts.setVolume(_vol);
       await _tts.awaitSpeakCompletion(true);
@@ -329,6 +332,7 @@ class _HudScreenState extends State<HudScreen>
   void _applyVolume() {
     _bgm.setVolume(_bgmTarget);
     _tts.setVolume(_vol);
+    _voice.setVolume(_vol.clamp(0.05, 1.0).toDouble());
   }
 
   void _setState(VoiceState s) {
@@ -361,6 +365,9 @@ class _HudScreenState extends State<HudScreen>
       return;
     }
     if (_state == VoiceState.speaking) {
+      _voiceDone?.complete();
+      _voiceDone = null;
+      await _voice.stop();
       await _tts.stop();
       _setState(VoiceState.idle);
       return;
@@ -390,7 +397,7 @@ class _HudScreenState extends State<HudScreen>
         await _sfx.play(DeviceFileSource(_sfxPath!), volume: _vol.clamp(0.1, 1.0).toDouble());
       }
     } catch (_) {}
-    await Future.delayed(const Duration(milliseconds: 700));
+    await Future.delayed(const Duration(milliseconds: 250));
 
     await _startRecording();
   }
@@ -535,9 +542,10 @@ class _HudScreenState extends State<HudScreen>
               'user_id': kUserId,
               'audio': b64,
               'system_prompt': kPersona,
+              'want_audio': true,
             }),
           )
-          .timeout(const Duration(seconds: 45));
+          .timeout(const Duration(seconds: 100));
 
       if (res.statusCode != 200) {
         throw Exception('Server ${res.statusCode}');
@@ -551,8 +559,13 @@ class _HudScreenState extends State<HudScreen>
         _userText = userText;
         _link = 'UPLINK: OK';
       });
+      final audioB64 = (data['audio_b64'] ?? '').toString();
       if (reply.isNotEmpty) {
-        await _speak(reply);
+        if (audioB64.isNotEmpty) {
+          await _playVoice(audioB64, reply);
+        } else {
+          await _speak(reply);
+        }
       } else {
         _setState(VoiceState.idle);
       }
@@ -569,6 +582,38 @@ class _HudScreenState extends State<HudScreen>
       _link = 'UPLINK: ERROR';
     });
     _setState(VoiceState.idle);
+  }
+
+  // ── সার্ভারের HD ভয়েস চালানো (ফেল করলে ফোনের TTS) ──
+  Future<void> _playVoice(String b64, String fallbackText) async {
+    _setState(VoiceState.speaking);
+    final c = Completer<void>();
+    _voiceDone = c;
+    StreamSubscription<void>? sub;
+    bool played = false;
+    try {
+      final dir = await getTemporaryDirectory();
+      final f = File('${dir.path}/tx_reply.mp3');
+      await f.writeAsBytes(base64Decode(b64), flush: true);
+      sub = _voice.onPlayerComplete.listen((_) {
+        if (!c.isCompleted) c.complete();
+      });
+      await _voice.setVolume(_vol.clamp(0.05, 1.0).toDouble());
+      await _voice.play(DeviceFileSource(f.path));
+      played = true;
+    } catch (_) {}
+    if (!played) {
+      await sub?.cancel();
+      await _speak(fallbackText);
+      return;
+    }
+    try {
+      await c.future.timeout(const Duration(seconds: 60));
+    } catch (_) {}
+    await sub?.cancel();
+    if (identical(_voiceDone, c) && mounted && _state == VoiceState.speaking) {
+      _setState(VoiceState.idle);
+    }
   }
 
   Future<void> _speak(String text) async {
