@@ -20,9 +20,10 @@ const String kUserId = 'android_user';
 const String kTtsLang = 'bn-BD';
 
 const double kSpeechThresholdDb = -46; // এর উপরে হলে কথা বলছে ধরা হবে
-const int kSilenceStopMs = 1800; // কথা বলার পর এতক্ষণ চুপ থাকলে রেকর্ড বন্ধ
+const int kSilenceStopMs = 1300; // কথা বলার পর এতক্ষণ চুপ থাকলে রেকর্ড বন্ধ
 const int kNoSpeechTimeoutMs = 8000; // কিছু না বললে ৫ সেকেন্ডে বন্ধ
-const int kMaxRecordMs = 30000;
+const int kMaxRecordMs = 20000;
+const int kSfxIgnoreMs = 1300; // শুরুর টোন চলার সময় মাইক কিছু ধরবে না
 
 // Tx 800 Mini এর ব্যক্তিত্ব (সার্ভার এটা system prompt হিসেবে ব্যবহার করবে)
 const String kPersona =
@@ -233,6 +234,7 @@ class _HudScreenState extends State<HudScreen>
   double _elapsed = 0;
   double _silentMs = 0;
   bool _stopping = false;
+  double _floorDb = 0; // সবচেয়ে শান্ত মুহূর্তের আওয়াজ (ঘরের নয়েজ)
 
   @override
   void initState() {
@@ -321,7 +323,7 @@ class _HudScreenState extends State<HudScreen>
       case VoiceState.idle:
         return base;
       case VoiceState.listening:
-        return base * 0.15;
+        return 0.0;
       case VoiceState.processing:
         return base * 0.3;
       case VoiceState.speaking:
@@ -466,6 +468,7 @@ class _HudScreenState extends State<HudScreen>
     _stopping = false;
     _elapsed = 0;
     _silentMs = 0;
+    _floorDb = 0;
     _recStart = DateTime.now();
     _lastVoice = _recStart;
     _setState(VoiceState.listening);
@@ -474,9 +477,14 @@ class _HudScreenState extends State<HudScreen>
       _pcm.add(chunk);
       final db = _chunkDb(chunk);
       clock.targetLevel = ((db + 55) / 55).clamp(0.0, 1.0).toDouble();
-      if (db > kSpeechThresholdDb) {
-        _heard = true;
-        _lastVoice = DateTime.now();
+      if (db < _floorDb) _floorDb = db;
+      final sinceStart = DateTime.now().difference(_recStart).inMilliseconds;
+      if (sinceStart > kSfxIgnoreMs) {
+        final thr = math.max(kSpeechThresholdDb, _floorDb.clamp(-60.0, -20.0) + 8);
+        if (db > thr) {
+          _heard = true;
+          _lastVoice = DateTime.now();
+        }
       }
     });
 
@@ -545,7 +553,7 @@ class _HudScreenState extends State<HudScreen>
               'want_audio': true,
             }),
           )
-          .timeout(const Duration(seconds: 100));
+          .timeout(const Duration(seconds: 45));
 
       if (res.statusCode != 200) {
         throw Exception('Server ${res.statusCode}');
