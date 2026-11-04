@@ -13,6 +13,9 @@ import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
+import 'package:speech_to_text/speech_recognition_error.dart';
+import 'package:speech_to_text/speech_recognition_result.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 // ───────────────────────── CONFIG ─────────────────────────
 const String kApiUrl = 'https://tx800-backend.vercel.app/api';
@@ -234,6 +237,15 @@ class _HudScreenState extends State<HudScreen>
   double _elapsed = 0;
   double _silentMs = 0;
   bool _stopping = false;
+
+  // ফোনের Google বাংলা রিকগনিশন
+  final stt.SpeechToText _stt = stt.SpeechToText();
+  bool _sttInitDone = false;
+  bool _sttReady = false;
+  bool _useStt = false;
+  String _sttLocale = 'bn_BD';
+  String _lastWords = '';
+  int _sttSession = 0;
   double _floorDb = 0; // সবচেয়ে শান্ত মুহূর্তের আওয়াজ (ঘরের নয়েজ)
   double _peakDb = -90; // কথার সবচেয়ে জোরালো আওয়াজ
 
@@ -263,6 +275,7 @@ class _HudScreenState extends State<HudScreen>
     _recTimer?.cancel();
     _ampSub?.cancel();
     _rec.dispose();
+    _stt.cancel();
     _bgm.dispose();
     _sfx.dispose();
     _voice.dispose();
@@ -364,7 +377,15 @@ class _HudScreenState extends State<HudScreen>
     HapticFeedback.mediumImpact();
     if (_state == VoiceState.processing) return;
     if (_state == VoiceState.listening) {
-      await _finishRecording();
+      if (_useStt) {
+        try {
+          await _stt.stop();
+        } catch (_) {}
+        await Future.delayed(const Duration(milliseconds: 600));
+        await _finishStt(_sttSession);
+      } else {
+        await _finishRecording();
+      }
       return;
     }
     if (_state == VoiceState.speaking) {
@@ -402,7 +423,153 @@ class _HudScreenState extends State<HudScreen>
     } catch (_) {}
     await Future.delayed(const Duration(milliseconds: 250));
 
+    await _ensureStt();
+    if (_sttReady) {
+      await _startStt();
+    } else {
+      await _startRecording();
+    }
+  }
+
+  // ───────── ফোনের Google বাংলা রিকগনিশন ─────────
+  Future<void> _ensureStt() async {
+    if (_sttInitDone) return;
+    _sttInitDone = true;
+    try {
+      final ok = await _stt.initialize(
+        onStatus: _onSttStatus,
+        onError: _onSttError,
+      );
+      if (ok) {
+        final locs = await _stt.locales();
+        String pick = '';
+        for (final l in locs) {
+          final id = l.localeId.toLowerCase().replaceAll('-', '_');
+          if (id == 'bn_bd') {
+            pick = l.localeId;
+            break;
+          }
+        }
+        if (pick.isEmpty) {
+          for (final l in locs) {
+            if (l.localeId.toLowerCase().startsWith('bn')) {
+              pick = l.localeId;
+              break;
+            }
+          }
+        }
+        if (pick.isNotEmpty) _sttLocale = pick;
+      }
+      _sttReady = ok;
+    } catch (e) {
+      debugPrint('stt init error: $e');
+      _sttReady = false;
+    }
+  }
+
+  Future<void> _startStt() async {
+    _lastWords = '';
+    _heard = false;
+    _stopping = false;
+    _elapsed = 0;
+    _silentMs = 0;
+    _recStart = DateTime.now();
+    _lastVoice = _recStart;
+    _useStt = true;
+    final id = ++_sttSession;
+    _setState(VoiceState.listening);
+
+    _recTimer?.cancel();
+    _recTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
+      final now = DateTime.now();
+      _elapsed = now.difference(_recStart).inMilliseconds / 1000;
+      _silentMs = now.difference(_lastVoice).inMilliseconds.toDouble();
+      _set(() {});
+      if (_elapsed > 25) _finishStt(id);
+    });
+
+    try {
+      await _stt.listen(
+        onResult: _onSttResult,
+        localeId: _sttLocale,
+        listenFor: const Duration(seconds: 20),
+        pauseFor: const Duration(seconds: 2),
+        onSoundLevelChange: (l) {
+          clock.targetLevel = ((l + 2) / 12).clamp(0.0, 1.0).toDouble();
+        },
+        listenOptions: stt.SpeechListenOptions(
+          partialResults: true,
+          cancelOnError: false,
+          listenMode: stt.ListenMode.dictation,
+        ),
+      );
+    } catch (e) {
+      debugPrint('stt listen error: $e');
+      await _sttFallback();
+    }
+  }
+
+  Future<void> _sttFallback() async {
+    _recTimer?.cancel();
+    try {
+      await _stt.cancel();
+    } catch (_) {}
+    _sttReady = false;
+    _useStt = false;
     await _startRecording();
+  }
+
+  void _onSttResult(SpeechRecognitionResult r) {
+    if (!_useStt || _state != VoiceState.listening || _stopping) return;
+    final w = r.recognizedWords.trim();
+    if (w.isNotEmpty) {
+      if (w != _lastWords) _lastVoice = DateTime.now();
+      _lastWords = w;
+      _heard = true;
+    }
+    if (r.finalResult) _finishStt(_sttSession);
+  }
+
+  void _onSttStatus(String status) {
+    if (!_useStt || _state != VoiceState.listening || _stopping) return;
+    if (status == 'done' || status == 'notListening') {
+      final id = _sttSession;
+      Future.delayed(const Duration(milliseconds: 500), () => _finishStt(id));
+    }
+  }
+
+  void _onSttError(SpeechRecognitionError e) {
+    if (!_useStt || _state != VoiceState.listening || _stopping) return;
+    final msg = e.errorMsg;
+    if (msg.contains('language')) {
+      _sttFallback();
+      return;
+    }
+    if (_lastWords.isNotEmpty) {
+      _finishStt(_sttSession);
+    } else {
+      _stopping = true;
+      _recTimer?.cancel();
+      _set(() => _notice = 'কোনো কথা শোনা যায়নি। আবার ট্যাপ করুন।');
+      _setState(VoiceState.idle);
+    }
+  }
+
+  Future<void> _finishStt(int id) async {
+    if (id != _sttSession || _stopping) return;
+    _stopping = true;
+    _recTimer?.cancel();
+    try {
+      await _stt.stop();
+    } catch (_) {}
+    final text = _lastWords.trim();
+    if (text.isEmpty) {
+      _set(() => _notice = 'কোনো কথা শোনা যায়নি। আবার ট্যাপ করুন।');
+      _setState(VoiceState.idle);
+      return;
+    }
+    _setState(VoiceState.processing);
+    await _sendToBackend('', text: text);
   }
 
   // ── WAV হেডার বানানো (16kHz, mono, 16-bit) ──
@@ -448,7 +615,30 @@ class _HudScreenState extends State<HudScreen>
     return 20 * math.log(rms / 32768) / math.ln10;
   }
 
+  // ── আওয়াজ ছোট হলে জোরালো করা (শোনার ভুল কমাতে) ──
+  Uint8List _normalizePcm(Uint8List pcm) {
+    final n = pcm.length ~/ 2;
+    if (n == 0) return pcm;
+    final src = ByteData.sublistView(pcm);
+    var peak = 0;
+    for (var i = 0; i < n; i++) {
+      final v = src.getInt16(i * 2, Endian.little).abs();
+      if (v > peak) peak = v;
+    }
+    if (peak < 200) return pcm;
+    final gain = math.min(8.0, 29000 / peak);
+    if (gain < 1.15) return pcm;
+    final out = Uint8List(n * 2);
+    final dst = ByteData.sublistView(out);
+    for (var i = 0; i < n; i++) {
+      final v = src.getInt16(i * 2, Endian.little);
+      dst.setInt16(i * 2, (v * gain).round().clamp(-32768, 32767).toInt(), Endian.little);
+    }
+    return out;
+  }
+
   Future<void> _startRecording() async {
+    _useStt = false;
     _pcm.clear();
     Stream<Uint8List> stream;
     try {
@@ -457,6 +647,8 @@ class _HudScreenState extends State<HudScreen>
           encoder: AudioEncoder.pcm16bits,
           sampleRate: 16000,
           numChannels: 1,
+          autoGain: true,
+          noiseSuppress: true,
         ),
       );
     } catch (e) {
@@ -531,7 +723,7 @@ class _HudScreenState extends State<HudScreen>
     try {
       final dir = await getTemporaryDirectory();
       path = '${dir.path}/tx_input.wav';
-      await File(path).writeAsBytes(_wav(pcm), flush: true);
+      await File(path).writeAsBytes(_wav(_normalizePcm(pcm)), flush: true);
     } catch (e) {
       _set(() => _notice = 'অডিও সেভ করা যায়নি: $e');
       _setState(VoiceState.idle);
@@ -542,17 +734,22 @@ class _HudScreenState extends State<HudScreen>
     await _sendToBackend(path);
   }
 
-  Future<void> _sendToBackend(String path) async {
+  Future<void> _sendToBackend(String path, {String? text}) async {
     try {
-      final bytes = await File(path).readAsBytes();
-      final b64 = base64Encode(bytes);
+      final Map<String, dynamic> input;
+      if (text != null) {
+        input = {'text': text};
+      } else {
+        final bytes = await File(path).readAsBytes();
+        input = {'audio': base64Encode(bytes)};
+      }
       final res = await http
           .post(
             Uri.parse(kApiUrl),
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode({
               'user_id': kUserId,
-              'audio': b64,
+              ...input,
               'system_prompt': kPersona,
               'want_audio': true,
             }),
